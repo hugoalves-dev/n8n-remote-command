@@ -10,11 +10,11 @@ func TestValidateCommandAcceptsCurrentTargetAndFutureExpiry(t *testing.T) {
 	now := time.Now().UTC()
 	raw := `{"version":1,"commandId":"8ddc0c10-253a-4e37-895f-c4b749e1c312","correlationId":"d840886f-3684-4180-b8b2-97c0402e6c69","target":"jcpc38","action":"KILL_ANYDESK","args":{},"requestedAt":"` + now.Add(-time.Minute).Format(time.RFC3339) + `","expiresAt":"` + now.Add(time.Minute).Format(time.RFC3339) + `"}`
 
-	command, err := validateCommand(raw, "jcpc38", now)
+	command, _, err := validateCommand(raw, "jcpc38", defaultActions(), now)
 	if err != nil {
 		t.Fatalf("validateCommand() error = %v", err)
 	}
-	if command.Action != allowedAction || command.Target != "jcpc38" {
+	if command.Action != killAnyDeskAction || command.Target != "jcpc38" {
 		t.Fatalf("validateCommand() = %+v", command)
 	}
 }
@@ -23,7 +23,7 @@ func TestValidateCommandRejectsWrongTarget(t *testing.T) {
 	now := time.Now().UTC()
 	raw := `{"version":1,"commandId":"8ddc0c10-253a-4e37-895f-c4b749e1c312","correlationId":"d840886f-3684-4180-b8b2-97c0402e6c69","target":"other-pc","action":"KILL_ANYDESK","args":{},"requestedAt":"` + now.Add(-time.Minute).Format(time.RFC3339) + `","expiresAt":"` + now.Add(time.Minute).Format(time.RFC3339) + `"}`
 
-	_, err := validateCommand(raw, "jcpc38", now)
+	_, _, err := validateCommand(raw, "jcpc38", defaultActions(), now)
 	if err == nil || !strings.Contains(err.Error(), "target") {
 		t.Fatalf("validateCommand() error = %v, want target error", err)
 	}

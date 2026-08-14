@@ -1,5 +1,6 @@
 {
   "machineId": "jcpc38",
+  "allowedActions": ["KILL_ANYDESK"],
   "anyDeskExecutablePath": "C:/Program Files (x86)/AnyDesk/AnyDesk.exe",
   "ssh": {
     "host": "your-vps.example.com",

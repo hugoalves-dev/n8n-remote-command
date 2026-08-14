@@ -9,6 +9,7 @@ V2 uses an n8n form to enqueue an allowlisted `KILL_ANYDESK` command in a privat
 - `agent/config.example.json`: safe configuration template.
 - `agent/requirements.txt`: Python dependencies.
 - `agent-go/`: Go implementation of the Windows agent (recommended for deployment).
+- `docs/specs/`: command catalog specification and the checklist for adding an action.
 - `.github/workflows/agent-go.yml`: CI for every push/PR; versioned Releases only for `v*` tags.
 
 ## Install the Go agent (recommended)
@@ -22,9 +23,55 @@ V2 uses an n8n form to enqueue an allowlisted `KILL_ANYDESK` command in a privat
    .\anydesk-killer-agent-windows-amd64.exe --config C:\AnyDeskKiller\config.json
    ```
 
-The executable accepts only an unexpired, version-1 `KILL_ANYDESK` envelope targeted to its configured machine ID. The only optional argument is `reopenAnyDesk: true`; when set, it starts AnyDesk from known local paths only after it terminated at least one process. There is no generic shell or remote-command execution path.
+The executable accepts only an unexpired, version-1 envelope targeted to its configured machine ID, carrying an action that is both compiled into the catalog and enabled on that machine. `KILL_ANYDESK` is the only catalog entry. Its one optional argument is `reopenAnyDesk: true`; when set, it starts AnyDesk from known local paths after the kill phase, even if nothing was running. There is no generic shell or remote-command execution path.
 
 To publish a new binary, push a tag such as `v1.0.0`. The Release includes a ZIP and its SHA-256 checksum. Normal pushes and pull requests only run validation/build and upload a temporary Actions artifact.
+
+## Command catalog
+
+Actions live in a registry compiled into the agent (`agent-go/catalog.go`). Each entry declares its
+argument schema, whether it is idempotent, the longest envelope lifetime it accepts, and whether it
+is enabled by default. Nothing arriving on the queue can add, rename or reconfigure an action, and no
+handler ever receives received text as an executable or a command line.
+
+`allowedActions` in `config.json` is the per-machine allowlist:
+
+```json
+"allowedActions": ["KILL_ANYDESK"]
+```
+
+- Omit it and the machine accepts only the actions marked as enabled by default — today just
+  `KILL_ANYDESK`. A future catalog entry therefore stays inert until it is enabled on purpose.
+- Set it to `[]` to make a machine accept no command at all while leaving the agent connected.
+- A name that is not in the compiled catalog stops the agent at startup with that name in the error,
+  so a typo never silently widens or narrows the surface.
+
+An envelope is rejected — never executed — when the action is unknown, when the action is not enabled
+on that machine, when `args` is not an object, when it carries a key the action did not declare, when
+a declared key has the wrong type, when `expiresAt - requestedAt` exceeds the action ceiling, or when
+the envelope has already expired.
+
+The agent also remembers recent `commandId` values, bounded by age and by count, so a redelivery
+after a reconnect cannot run an action twice. This is an in-memory guard: it does not survive an
+agent restart, which is why the specification requires the Redis Streams migration before the first
+non-idempotent action.
+
+### Redis keys per machine
+
+| Key | Content |
+| --- | --- |
+| `remote-agent:commands:<machineId>` | queued envelopes, consumed by the agent |
+| `remote-agent:results:<machineId>` | one entry per handled command, with `action`, `status` and `outcome` |
+| `remote-agent:audit:<machineId>` | who asked, target, action, status and timestamps — never arguments or raw payloads |
+| `remote-agent:dead-letter:<machineId>` | rejected envelopes with the rejection reason |
+
+Result `status` is `SUCCEEDED`, `FAILED` for a handler error, or `DUPLICATE` for a repeated
+`commandId`. All four lists are trimmed to a fixed retention.
+
+Adding an action requires its own spec, a short threat model and rejection tests. The checklist is in
+[`docs/specs/adicionar-nova-action.md`](docs/specs/adicionar-nova-action.md), and the pending
+decisions are tracked in
+[`docs/specs/controlled-remote-command-catalog.md`](docs/specs/controlled-remote-command-catalog.md).
 
 ## Restricted SSH access to Redis
 
@@ -468,6 +515,8 @@ A container shown only as `6379/tcp` is not published to the host. The expected 
 5. Start it with `pyw agent/kill_anydesk_agent.pyw --config agent/config.json`.
 
 The script has no shell or remote-command execution path. It accepts only an unexpired, version-1 `KILL_ANYDESK` envelope targeted to its own machine ID.
+
+It stays on the single hardcoded action: the command catalog, `allowedActions`, `commandId` deduplication and the audit list exist only in the Go agent. Use the Go agent for anything beyond the MVP.
 
 ## n8n setup
 

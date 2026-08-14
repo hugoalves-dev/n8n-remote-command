@@ -22,9 +22,16 @@ import (
 )
 
 const (
-	allowedAction    = "KILL_ANYDESK"
 	maxMessageBytes  = 8 * 1024
 	reconnectMaxWait = time.Minute
+
+	// Deduplication keeps a commandId for longer than any action may stay valid.
+	dedupWindow     = time.Hour
+	dedupMaxEntries = 4096
+
+	resultRetention     = 500
+	auditRetention      = 1000
+	deadLetterRetention = 200
 )
 
 type config struct {
@@ -41,8 +48,10 @@ type config struct {
 		RemotePort int    `json:"remotePort"`
 		Database   int    `json:"database"`
 	} `json:"redis"`
-	LogFile               string `json:"logFile"`
-	AnyDeskExecutablePath string `json:"anyDeskExecutablePath"`
+	LogFile               string   `json:"logFile"`
+	AnyDeskExecutablePath string   `json:"anyDeskExecutablePath"`
+	AllowedActions        []string `json:"allowedActions"`
+	enabled               actionSet
 }
 
 type command struct {
@@ -52,9 +61,10 @@ type command struct {
 	Target        string          `json:"target"`
 	Action        string          `json:"action"`
 	Args          json.RawMessage `json:"args"`
+	RequestedBy   string          `json:"requestedBy"`
 	RequestedAt   time.Time       `json:"requestedAt"`
 	ExpiresAt     time.Time       `json:"expiresAt"`
-	ReopenAnyDesk bool            `json:"-"`
+	arguments     any
 }
 
 type outcome struct {
@@ -100,50 +110,59 @@ func loadConfig(path string) (config, error) {
 	if _, err := os.Stat(c.SSH.KnownHosts); err != nil {
 		return config{}, fmt.Errorf("SSH knownHosts: %w", err)
 	}
+	c.enabled = defaultActions()
+	if c.AllowedActions != nil {
+		enabled, err := configuredActions(c.AllowedActions)
+		if err != nil {
+			return config{}, err
+		}
+		c.enabled = enabled
+	}
 	return c, nil
 }
 
-func validateCommand(raw, machineID string, now time.Time) (command, error) {
+func validateCommand(raw, machineID string, allowed actionSet, now time.Time) (command, actionSpec, error) {
 	if len([]byte(raw)) >= maxMessageBytes {
-		return command{}, errors.New("message is too large")
+		return command{}, actionSpec{}, errors.New("message is too large")
 	}
 	var c command
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
-		return command{}, fmt.Errorf("invalid JSON: %w", err)
+		return command{}, actionSpec{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 	if c.Version != 1 {
-		return command{}, errors.New("unsupported version")
+		return command{}, actionSpec{}, errors.New("unsupported version")
 	}
 	if c.CommandID == "" || c.CorrelationID == "" {
-		return command{}, errors.New("commandId and correlationId are required")
+		return command{}, actionSpec{}, errors.New("commandId and correlationId are required")
 	}
 	if c.Target != machineID {
-		return command{}, errors.New("message target does not match this machine")
+		return command{}, actionSpec{}, errors.New("message target does not match this machine")
 	}
-	if c.Action != allowedAction {
-		return command{}, errors.New("action is not allowed")
+	if len(c.RequestedBy) > maxRequesterLength {
+		return command{}, actionSpec{}, errors.New("requestedBy is too long")
 	}
-	var args map[string]json.RawMessage
-	if err := json.Unmarshal(c.Args, &args); err != nil {
-		return command{}, errors.New("arguments must be an object")
+	if _, known := catalog[c.Action]; !known {
+		return command{}, actionSpec{}, errors.New("action is not allowed")
 	}
-	if len(args) > 1 {
-		return command{}, errors.New("arguments are not allowed for this action")
+	spec, authorized := allowed[c.Action]
+	if !authorized {
+		return command{}, actionSpec{}, errors.New("action is not authorized on this machine")
 	}
-	if raw, ok := args["reopenAnyDesk"]; ok {
-		if err := json.Unmarshal(raw, &c.ReopenAnyDesk); err != nil {
-			return command{}, errors.New("reopenAnyDesk must be a boolean")
-		}
-	} else if len(args) != 0 {
-		return command{}, errors.New("arguments are not allowed for this action")
+	arguments, err := spec.parseArgs(c.Args)
+	if err != nil {
+		return command{}, actionSpec{}, err
 	}
+	c.arguments = arguments
 	if c.RequestedAt.Location() != time.UTC || c.ExpiresAt.Location() != time.UTC {
-		return command{}, errors.New("timestamps must be UTC")
+		return command{}, actionSpec{}, errors.New("timestamps must be UTC")
 	}
 	if !c.ExpiresAt.After(c.RequestedAt) || !c.ExpiresAt.After(now) {
-		return command{}, errors.New("message has expired")
+		return command{}, actionSpec{}, errors.New("message has expired")
 	}
-	return c, nil
+	if c.ExpiresAt.Sub(c.RequestedAt) > spec.maxLifetime {
+		return command{}, actionSpec{}, fmt.Errorf("command lifetime exceeds the %s maximum for this action", spec.maxLifetime)
+	}
+	return c, spec, nil
 }
 
 func killAnyDesk(run commandRunner, tasklistOutput string) (outcome, error) {
@@ -261,7 +280,61 @@ func redisOptions(c config, address string) *redis.Options {
 
 func queue(machineID, suffix string) string { return "remote-agent:" + suffix + ":" + machineID }
 
-func consume(ctx context.Context, c config, logger *log.Logger) error {
+func resultPayload(machineID string, c command, status, reason string, result any, completedAt time.Time) map[string]any {
+	payload := map[string]any{
+		"commandId":     c.CommandID,
+		"correlationId": c.CorrelationID,
+		"target":        machineID,
+		"action":        c.Action,
+		"status":        status,
+		"completedAt":   completedAt,
+	}
+	if result != nil {
+		payload["outcome"] = result
+	}
+	if reason != "" {
+		payload["reason"] = boundedReason(reason)
+	}
+	return payload
+}
+
+func deadLetterPayload(machineID, raw, reason string, receivedAt time.Time) map[string]any {
+	return map[string]any{
+		"target":     machineID,
+		"status":     auditRejected,
+		"reason":     reason,
+		"receivedAt": receivedAt,
+		"raw":        raw,
+	}
+}
+
+// publish appends one JSON entry and trims the list, so retention stays bounded.
+func publish(ctx context.Context, client *redis.Client, key string, entry any, retention int64) error {
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	if err := client.LPush(ctx, key, encoded).Err(); err != nil {
+		return err
+	}
+	return client.LTrim(ctx, key, 0, retention-1).Err()
+}
+
+func report(ctx context.Context, client *redis.Client, machineID string, cmd command, status, reason string, result any, receivedAt, completedAt time.Time) error {
+	if err := publish(ctx, client, queue(machineID, "results"), resultPayload(machineID, cmd, status, reason, result, completedAt), resultRetention); err != nil {
+		return err
+	}
+	return publish(ctx, client, queue(machineID, "audit"), commandAudit(cmd, status, reason, receivedAt, completedAt), auditRetention)
+}
+
+func reportRejection(ctx context.Context, client *redis.Client, machineID, raw, reason string, receivedAt time.Time) error {
+	if err := publish(ctx, client, queue(machineID, "dead-letter"), deadLetterPayload(machineID, raw, reason, receivedAt), deadLetterRetention); err != nil {
+		return err
+	}
+	return publish(ctx, client, queue(machineID, "audit"), rejectionAudit(machineID, reason, receivedAt), auditRetention)
+}
+
+func consume(ctx context.Context, c config, ledger *commandLedger, logger *log.Logger) error {
 	client, err := sshClient(c)
 	if err != nil {
 		return err
@@ -287,25 +360,37 @@ func consume(ctx context.Context, c config, logger *log.Logger) error {
 			return err
 		}
 		raw := item[1]
-		cmd, err := validateCommand(raw, c.MachineID, time.Now().UTC())
+		receivedAt := time.Now().UTC()
+		cmd, spec, err := validateCommand(raw, c.MachineID, c.enabled, receivedAt)
 		if err != nil {
-			payload, _ := json.Marshal(map[string]any{"target": c.MachineID, "status": "REJECTED", "reason": err.Error(), "receivedAt": time.Now().UTC(), "raw": raw})
-			if publishErr := redisClient.LPush(ctx, queue(c.MachineID, "dead-letter"), payload).Err(); publishErr != nil {
-				return publishErr
+			if reportErr := reportRejection(ctx, redisClient, c.MachineID, raw, err.Error(), receivedAt); reportErr != nil {
+				return reportErr
 			}
 			logger.Printf("command rejected: %v", err)
 			continue
 		}
-		result, err := executeKill()
+		// An at-least-once queue may deliver the same envelope twice. The ledger answers
+		// once per commandId, before any handler runs.
+		if !ledger.admit(cmd.CommandID, receivedAt) {
+			if reportErr := report(ctx, redisClient, c.MachineID, cmd, auditDuplicate, "commandId was already handled", nil, receivedAt, time.Now().UTC()); reportErr != nil {
+				return reportErr
+			}
+			logger.Printf("%s skipped: duplicate commandId %s", cmd.Action, cmd.CommandID)
+			continue
+		}
+		result, err := spec.execute(c, cmd.arguments)
+		completedAt := time.Now().UTC()
 		if err != nil {
+			if reportErr := report(ctx, redisClient, c.MachineID, cmd, auditFailed, err.Error(), nil, receivedAt, completedAt); reportErr != nil {
+				return reportErr
+			}
+			logger.Printf("%s failed: %v", cmd.Action, err)
+			continue
+		}
+		if err := report(ctx, redisClient, c.MachineID, cmd, auditSucceeded, "", result, receivedAt, completedAt); err != nil {
 			return err
 		}
-		result = applyReopen(result, cmd.ReopenAnyDesk, c.AnyDeskExecutablePath, reopenAnyDesk)
-		payload, _ := json.Marshal(map[string]any{"commandId": cmd.CommandID, "correlationId": cmd.CorrelationID, "target": c.MachineID, "status": "SUCCEEDED", "completedAt": time.Now().UTC(), "outcome": result})
-		if err := redisClient.LPush(ctx, queue(c.MachineID, "results"), payload).Err(); err != nil {
-			return err
-		}
-		logger.Printf("KILL_ANYDESK completed: matched=%d forceKilled=%d", result.Matched, result.ForceKilled)
+		logger.Printf("%s completed: %+v", cmd.Action, result)
 	}
 	return ctx.Err()
 }
@@ -326,8 +411,11 @@ func main() {
 	}
 	defer file.Close()
 	logger := log.New(io.MultiWriter(os.Stdout, file), "anydesk-agent ", log.LstdFlags|log.LUTC)
+	// The ledger outlives reconnections: a redelivery after a transport failure is the
+	// most likely source of a duplicate commandId.
+	ledger := newCommandLedger(dedupWindow, dedupMaxEntries)
 	for wait := time.Second; ; wait = min(wait*2, reconnectMaxWait) {
-		err := consume(context.Background(), c, logger)
+		err := consume(context.Background(), c, ledger, logger)
 		logger.Printf("transport failure; reconnecting in %s: %v", wait, err)
 		time.Sleep(wait)
 	}
