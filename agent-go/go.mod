@@ -1,4 +1,4 @@
-module github.com/vitorhugo-dotnet/anydesk-killer-remote/agent-go
+module github.com/hugoalves-dev/n8n-remote-command/agent-go
 
 go 1.25.0
 

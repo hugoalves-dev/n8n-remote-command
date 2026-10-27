@@ -16,7 +16,7 @@ V2 uses an n8n form to enqueue an allowlisted `KILL_ANYDESK` command in a privat
 1. Create a restricted SSH user on the VPS and generate a dedicated key pair.
 2. Copy the private key and a verified `known_hosts` file to the computer. Never leave `knownHosts` empty.
 3. Copy `agent/config.example.json` to a local `config.json`, set the `machineId`, and keep it out of Git.
-4. Download `anydesk-killer-agent-windows-amd64.zip` from a [GitHub Release](https://github.com/vitorhugo-dotnet/anydesk-killer-remote/releases), extract it, then run:
+4. Download `anydesk-killer-agent-windows-amd64.zip` from a [GitHub Release](https://github.com/hugoalves-dev/anydesk-killer-remote/releases), extract it, then run:
 
    ```powershell
    .\anydesk-killer-agent-windows-amd64.exe --config C:\AnyDeskKiller\config.json
@@ -477,7 +477,7 @@ Then attach that credential to **LPUSH na fila privada**, test each destination,
 
 ## Workflow Git Sync
 
-The n8n Data Table **Workflow Git Sync** holds one row per workflow destination. A workflow may have several rows, so it can be mirrored to more than one repository. Only repositories under `vitorhugo-dotnet/*` are permitted.
+The n8n Data Table **Workflow Git Sync** holds one row per workflow destination. A workflow may have several rows, so it can be mirrored to more than one repository. Only repositories under `hugoalves-dev/*` are permitted.
 
 Required mapping columns are:
 
